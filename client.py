@@ -60,9 +60,20 @@ async def ask_question(question, style_preference=None, user_id="default_user"):
     """Function to directly ask a question with optional style preference and user memory (for programmatic use)"""
     agent = await setup_agent()
 
+    # Get recent conversation context
+    recent_context = await get_recent_context(agent, user_id)
+
     # Include CapAmerica sales assistant context in the question
     contextual_question = f"""
     You are a professional and knowledgeable sales assistant for CapAmerica, specializing in custom headwear and branded caps. Your role is to help customers find the perfect headwear products, provide accurate pricing information, and explain customization options.
+
+    {recent_context}
+
+    **CONVERSATION CONTEXT IS CRITICAL:**
+    - Remember all previously discussed products, pricing, and customer preferences
+    - When customers ask follow-up questions about "that hat," "the one we discussed," or similar references, use the conversation history to identify which product they mean
+    - Maintain context about quantities, embroidery types, and product features mentioned earlier
+    - If uncertain which product they're referring to, ask for clarification but first try to use the conversation history
 
     **CAPAMERICA PRODUCT CATALOG:**
     - 27+ Real Cap Products with IDs like i3038, i7041, i7256, i8501, etc.
@@ -77,6 +88,7 @@ async def ask_question(question, style_preference=None, user_id="default_user"):
     - Base Pricing: Includes standard flat embroidery (up to 10,000 stitches)
     - Price Range: $9.00 - $27.00 per unit depending on style and quantity
     - 3D Embroidery: Additional $3-5 per unit over flat embroidery
+    - Custom patches: Typically $1-3 per unit additional cost (confirm with specific product)
 
     **AVAILABLE TOOLS:**
     📦 PRODUCT CATALOG:
@@ -86,6 +98,9 @@ async def ask_question(question, style_preference=None, user_id="default_user"):
     4. get_all_products() - Complete product catalog
 
     **RESPONSE GUIDELINES:**
+    - **ALWAYS check conversation history first** before asking clarifying questions
+    - Refer back to specific products, prices, and details mentioned previously
+    - When customers ask about "that hat" or similar, look at the most recent product discussed
     - Provide accurate product information based on catalog data
     - Help customers find products that match their needs (style, features, price, colors)
     - Explain pricing tiers, embroidery options, and customization clearly
@@ -107,6 +122,39 @@ def clear_conversation(user_id: str):
     print(f"🧹 Cleared conversation memory for user: {user_id}")
     # Note: MemorySaver automatically manages conversation state
     # The memory is stored per thread_id (user_id), so conversations remain separate
+
+
+async def get_recent_context(agent, user_id: str) -> str:
+    """Get recent conversation context for better follow-up handling"""
+    try:
+        config = get_user_config(user_id)
+
+        # Get recent conversation history
+        result = await agent.aget_state(config)
+
+        if result and result.values and 'messages' in result.values:
+            messages = result.values['messages']
+
+            # Extract recent product discussions
+            recent_products = []
+            for msg in messages[-4:]:  # Look at last 4 messages
+                if hasattr(msg, 'content') and isinstance(msg.content, str):
+                    content = msg.content
+                    # Look for product IDs or product names in recent messages
+                    if 'i' in content and any(char.isdigit() for char in content):
+                        # Extract product IDs mentioned
+                        import re
+                        product_ids = re.findall(r'i\d+', content)
+                        recent_products.extend(product_ids)
+
+            if recent_products:
+                return f"RECENT CONTEXT: Customer was recently asking about product(s): {', '.join(set(recent_products))}. When they refer to 'that hat' or similar, they likely mean one of these products."
+
+        return ""
+
+    except Exception as e:
+        print(f"Error getting context: {e}")
+        return ""
 
 
 def get_conversation_summary(user_id: str) -> str:
