@@ -1,7 +1,6 @@
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.prebuilt import create_react_agent
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import MemorySaver
 
 from dotenv import load_dotenv
 load_dotenv()
@@ -9,17 +8,82 @@ load_dotenv()
 import asyncio
 import os
 import time
+import redis
+import json
+from datetime import datetime, timedelta
 from typing import Dict, Any
 
-# Global memory for conversation persistence
-memory = MemorySaver()
+HOST= os.environ["HOST"] = os.getenv("HOST")
+PORT= os.environ["PORT"] = os.getenv("PORT")
+PASSWORD = os.environ["PASSWORD"] = os.getenv("PASSWORD")
 
-def get_user_config(user_id: str) -> Dict[str, Any]:
-    """Get configuration for user-specific memory thread"""
-    return {"configurable": {"thread_id": f"user_{user_id}"}}
+# Redis Cloud connection for memory storage
+redis_client = redis.Redis(
+    host=HOST,
+    port=PORT,
+    decode_responses=True,
+    username="default",
+    password=PASSWORD,
+)
+
+# Test Redis connection
+try:
+    redis_client.ping()
+    print("✅ Redis Cloud connected successfully")
+except redis.ConnectionError as e:
+    print(f"❌ Redis Cloud connection failed: {e}")
+    print("⚠️  Falling back to memory-only mode")
+
+# Redis memory management functions
+def store_conversation_memory(user_id: str, messages: list, metadata: dict = None):
+    """Store conversation in Redis with 12-hour TTL"""
+    try:
+        memory_data = {
+            "messages": messages,
+            "metadata": metadata or {},
+            "last_updated": datetime.utcnow().isoformat(),
+            "user_id": user_id
+        }
+
+        # Store with 12-hour expiration (43200 seconds)
+        redis_client.setex(
+            f"conversation:{user_id}",
+            43200,  # 12 hours in seconds
+            json.dumps(memory_data)
+        )
+        print(f"💾 Stored conversation for user {user_id} with 12-hour TTL")
+    except Exception as e:
+        print(f"❌ Error storing conversation: {e}")
+
+
+def get_conversation_memory(user_id: str) -> dict:
+    """Retrieve conversation from Redis"""
+    try:
+        data = redis_client.get(f"conversation:{user_id}")
+        if data:
+            return json.loads(data)
+        return {"messages": [], "metadata": {}}
+    except Exception as e:
+        print(f"❌ Error retrieving conversation: {e}")
+        return {"messages": [], "metadata": {}}
+
+
+def clear_conversation_memory(user_id: str):
+    """Clear conversation memory for a specific user"""
+    try:
+        redis_client.delete(f"conversation:{user_id}")
+        print(f"🧹 Cleared conversation memory for user: {user_id}")
+    except Exception as e:
+        print(f"❌ Error clearing conversation: {e}")
+
+
+def get_conversation_summary(user_id: str) -> str:
+    """Get a summary of the conversation for continuity"""
+    return f"Conversation thread: {user_id} - CapAmerica product catalog inquiry"
+
 
 async def setup_agent():
-    """Setup MCP client and AI agent with memory"""
+    """Setup MCP client and AI agent (without LangGraph memory checkpointer)"""
     client = MultiServerMCPClient(
         {
             "Data_Fetch": {
@@ -35,24 +99,42 @@ async def setup_agent():
     tools = await client.get_tools()
     model = ChatOpenAI(model="gpt-4o-mini")
 
-    # Create agent with memory checkpointer
-    agent = create_react_agent(model, tools, checkpointer=memory)
+    # Create agent without LangGraph memory (we'll use Redis instead)
+    agent = create_react_agent(model, tools)
 
     return agent
 
 async def process_question(agent, user_question, user_id="default_user"):
-    """Send any user question to the agent with memory"""
+    """Send any user question to the agent with Redis memory"""
     print(f"\n🔍 Question: {user_question}")
     print("🔄 Processing...")
 
-    config = get_user_config(user_id)
+    # Get existing conversation from Redis
+    memory_data = get_conversation_memory(user_id)
 
-    response = await agent.ainvoke(
-        {"messages": [{"role": "user", "content": user_question}]},
-        config=config
-    )
+    # Build message history with new question
+    messages = memory_data.get("messages", [])
+    messages.append({"role": "user", "content": user_question})
 
-    return response['messages'][-1].content
+    # Add conversation context to messages for the agent
+    if len(messages) > 1:
+        context_messages = messages[-6:]  # Keep last 6 messages for context
+        full_messages = context_messages + [{"role": "system", "content":
+            f"Conversation history for context: {json.dumps([msg['content'] for msg in context_messages[-3:]])}"}]
+    else:
+        full_messages = [{"role": "user", "content": user_question}]
+
+    # Get response from agent
+    response = await agent.ainvoke({"messages": full_messages})
+
+    # Extract and store response
+    response_content = response['messages'][-1].content
+    messages.append({"role": "assistant", "content": response_content})
+
+    # Save updated conversation to Redis with 12-hour TTL
+    store_conversation_memory(user_id, messages)
+
+    return response_content
 
 
 # Alternative: Direct question function
@@ -61,7 +143,7 @@ async def ask_question(question, style_preference=None, user_id="default_user"):
     agent = await setup_agent()
 
     # Get recent conversation context
-    recent_context = await get_recent_context(agent, user_id)
+    recent_context = await get_recent_context(user_id)
 
     # Include CapAmerica sales assistant context in the question
     contextual_question = f"""
@@ -119,27 +201,22 @@ async def ask_question(question, style_preference=None, user_id="default_user"):
 
 def clear_conversation(user_id: str):
     """Clear conversation memory for a specific user"""
-    print(f"🧹 Cleared conversation memory for user: {user_id}")
-    # Note: MemorySaver automatically manages conversation state
-    # The memory is stored per thread_id (user_id), so conversations remain separate
+    clear_conversation_memory(user_id)
 
 
-async def get_recent_context(agent, user_id: str) -> str:
-    """Get recent conversation context for better follow-up handling"""
+async def get_recent_context(user_id: str) -> str:
+    """Get recent conversation context for better follow-up handling using Redis"""
     try:
-        config = get_user_config(user_id)
+        # Get conversation from Redis
+        memory_data = get_conversation_memory(user_id)
+        messages = memory_data.get("messages", [])
 
-        # Get recent conversation history
-        result = await agent.aget_state(config)
-
-        if result and result.values and 'messages' in result.values:
-            messages = result.values['messages']
-
+        if messages:
             # Extract recent product discussions
             recent_products = []
             for msg in messages[-4:]:  # Look at last 4 messages
-                if hasattr(msg, 'content') and isinstance(msg.content, str):
-                    content = msg.content
+                if isinstance(msg, dict) and 'content' in msg:
+                    content = msg['content']
                     # Look for product IDs or product names in recent messages
                     if 'i' in content and any(char.isdigit() for char in content):
                         # Extract product IDs mentioned
@@ -156,8 +233,6 @@ async def get_recent_context(agent, user_id: str) -> str:
         print(f"Error getting context: {e}")
         return ""
 
-
-def get_conversation_summary(user_id: str) -> str:
-    """Get a summary of the conversation for continuity"""
-    return f"Conversation thread: user_{user_id} - CapAmerica product catalog inquiry"
-
+# if __name__ == "__main__":
+#     # Run interactive mode
+#     asyncio.run(main())
