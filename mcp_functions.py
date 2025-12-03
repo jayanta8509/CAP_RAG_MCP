@@ -6,14 +6,16 @@ Small, modular functions to fetch data from local CSV files
 import pandas as pd
 from typing import Dict
 import os
+import json
 from mcp.server.fastmcp import FastMCP
-# Define paths to CSV files
+# Define paths to data files
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PRODUCTS_PATH = os.path.join(BASE_DIR, 'products.csv')
+PATCHES_PATH = os.path.join(BASE_DIR, 'patches.json')
 
 mcp = FastMCP("Data_Fetcher")
 
-# Load CSV files
+# Load data files
 def load_csv_data():
     """Load products CSV file into pandas DataFrame"""
     try:
@@ -21,6 +23,16 @@ def load_csv_data():
         return products
     except Exception as e:
         raise ValueError(f"Error loading products CSV file: {str(e)}")
+
+
+def load_patches_data():
+    """Load patches JSON file"""
+    try:
+        with open(PATCHES_PATH, 'r') as file:
+            patches = json.load(file)
+        return patches
+    except Exception as e:
+        raise ValueError(f"Error loading patches JSON file: {str(e)}")
 
 
 
@@ -287,6 +299,180 @@ def get_all_products() -> Dict:
 
 
 
+
+
+# ==================== PATCH FUNCTIONS ====================
+
+@mcp.tool()
+def get_patch_pricing(patch_name: str = None) -> Dict:
+    """
+    Get pricing information for patches and customization options.
+
+    Perfect for customers asking about adding patches, embroidery alternatives,
+    or custom branding options to their cap orders.
+
+    Args:
+        patch_name: Specific patch name (e.g., "Molded Rubber Patch", "Woven Patch")
+                   If None, returns all available patch options
+
+    Returns:
+        Dictionary containing:
+        - patch_name: Name of the patch (if specified)
+        - patch_price: Price per unit for the patch
+        - total_patches: Number of available patch types (if none specified)
+        - available_patches: List of all patch options with pricing (if none specified)
+
+    Example usage:
+        - "How much is a Molded Rubber Patch?"
+        - "What patch options do you have?"
+        - "Show me all patch pricing"
+        - "Price for Woven Patch"
+    """
+    patches = load_patches_data()
+
+    if patch_name:
+        # Find specific patch
+        patch_name_lower = patch_name.lower()
+        for patch in patches:
+            if patch_name_lower in patch['name'].lower():
+                return {
+                    "patch_name": patch['name'],
+                    "patch_price": float(patch['price']),
+                    "currency": "USD",
+                    "price_per_unit": True
+                }
+
+        # If not found, suggest alternatives
+        available_names = [p['name'] for p in patches]
+        return {
+            "error": f"Patch '{patch_name}' not found",
+            "available_patches": available_names[:5],
+            "hint": "Try: Molded Rubber Patch, Woven Patch, or Embroidered Patch"
+        }
+    else:
+        # Return all patches
+        return {
+            "total_patches": len(patches),
+            "available_patches": patches,
+            "price_range": {
+                "min_price": min(p['price'] for p in patches),
+                "max_price": max(p['price'] for p in patches)
+            }
+        }
+
+@mcp.tool()
+def calculate_total_price(product_id: str, quantity: int = 24, embroidery_type: str = "flat", patch_name: str = None) -> Dict:
+    """
+    Calculate complete pricing including base product, embroidery, and patches.
+
+    This is the ultimate pricing tool that combines product pricing with customization options.
+
+    Args:
+        product_id: Product identifier (e.g., 'i3038', '3038', 'i7041')
+        quantity: Number of units (24, 48, 96, 144, 576, or 2500+)
+        embroidery_type: Type of embroidery ('flat', '3d', or 'none')
+        patch_name: Optional patch name (e.g., 'Molded Rubber Patch')
+
+    Returns:
+        Dictionary containing:
+        - product_id: Product identifier
+        - product_title: Product name
+        - quantity: Order quantity
+        - embroidery_type: Type of embroidery
+        - base_price: Product price per unit
+        - embroidery_price: Embroidery cost per unit (if applicable)
+        - patch_price: Patch cost per unit (if applicable)
+        - unit_price: Total price per unit
+        - total_cost: Total cost for the order
+        - itemized_breakdown: Detailed cost breakdown
+
+    Example usage:
+        - "Calculate total price for i7041 with 48 units and molded rubber patch"
+        - "What's the cost for 96 units of i8501 with 3D embroidery and leather patch?"
+        - "Price for 24 units of i7256 with flat embroidery only"
+    """
+    products = load_csv_data()
+    patches = load_patches_data()
+
+    # Normalize product_id
+    if not product_id.startswith('i'):
+        product_id = 'i' + product_id
+
+    # Find product
+    product = products[products['id'] == product_id]
+    if product.empty:
+        return {"error": f"Product {product_id} not found"}
+
+    product_data = product.iloc[0]
+
+    # Determine embroidery pricing
+    embroidery_type = embroidery_type.lower()
+    if embroidery_type not in ['flat', '3d', 'none']:
+        embroidery_type = 'flat'
+
+    # Find appropriate pricing column based on quantity
+    if quantity >= 2500:
+        qty_column = f"{embroidery_type}_embroidery_2500+"
+    elif quantity >= 576:
+        qty_column = f"{embroidery_type}_embroidery_576"
+    elif quantity >= 144:
+        qty_column = f"{embroidery_type}_embroidery_144"
+    elif quantity >= 96:
+        qty_column = f"{embroidery_type}_embroidery_96"
+    elif quantity >= 48:
+        qty_column = f"{embroidery_type}_embroidery_48"
+    else:
+        qty_column = f"{embroidery_type}_embroidery_24"
+
+    base_price = product_data.get(qty_column)
+    if pd.isna(base_price):
+        return {"error": f"Pricing not available for {embroidery_type} embroidery at quantity {quantity}"}
+
+    # Calculate patch price if specified
+    patch_cost = 0
+    patch_display_name = None
+    if patch_name:
+        patch_name_lower = patch_name.lower()
+        for patch in patches:
+            if patch_name_lower in patch['name'].lower():
+                patch_cost = patch['price']
+                patch_display_name = patch['name']
+                break
+
+    # Calculate totals
+    unit_price = float(base_price) + patch_cost
+    total_cost = unit_price * quantity
+
+    # Create itemized breakdown
+    breakdown = {
+        "base_product": {
+            "name": product_data['title'],
+            "unit_price": float(base_price),
+            "total": float(base_price) * quantity
+        }
+    }
+
+    if patch_cost > 0:
+        breakdown["patch"] = {
+            "name": patch_display_name,
+            "unit_price": patch_cost,
+            "total": patch_cost * quantity
+        }
+
+    return {
+        "product_id": product_id,
+        "product_title": product_data['title'],
+        "quantity": quantity,
+        "embroidery_type": embroidery_type,
+        "base_price": float(base_price),
+        "embroidery_cost": float(base_price) if embroidery_type != 'none' else 0,
+        "patch_name": patch_display_name,
+        "patch_cost": patch_cost,
+        "unit_price": unit_price,
+        "total_cost": total_cost,
+        "currency": "USD",
+        "itemized_breakdown": breakdown
+    }
 
 
 if __name__ == "__main__":
