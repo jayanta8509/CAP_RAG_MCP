@@ -88,7 +88,7 @@ async def setup_agent():
         {
             "Data_Fetch": {
                 "command": "python",
-                "args": ["mcp_functions.py"],
+                "args": ["mcp_functions_db.py"],
                 "transport": "stdio",
             }
         }
