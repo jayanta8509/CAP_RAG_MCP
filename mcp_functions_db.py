@@ -3,803 +3,368 @@ from mcp.server.fastmcp import FastMCP
 
 from db import fetch_one, fetch_all, build_ilike_pattern
 
-mcp = FastMCP("DB_Data_Fetcher")
+mcp = FastMCP("DB_Customer_Chatbot")
+
+BASE_URL = "https://showmecustomheadwearapi.bestworks.cloud"
 
 
-#utility
-def _normalize_int(v: Union[str, int]) -> int:
-    if isinstance(v, int):
-        return v
-    return int(str(v).strip())
+#utilities
+def _safe_str(v: Any) -> str:
+    return "" if v is None else str(v)
 
 
-def _tier_bucket(quantity: int) -> int:
+def _full_url(path_or_url: Optional[str]) -> Optional[str]:
     """
-    Your old CSV logic used buckets like 24/48/96/144/576/2500+
-    For DB tiers: we select the best tier where min_qty <= quantity
-    and (max_qty is null or quantity <= max_qty)
+    If DB has a relative path like "/uploads/x.jpg", return BASE_URL + path.
+    If DB already stores full URL (http/https), return as-is.
     """
-    return int(quantity)
+    if not path_or_url:
+        return None
+    s = str(path_or_url).strip()
+    if s.startswith("http://") or s.startswith("https://"):
+        return s
+    if not s.startswith("/"):
+        s = "/" + s
+    return BASE_URL + s
 
 
-#health
-@mcp.tool()
-async def db_health_check() -> Dict[str, Any]:
-    row = await fetch_one("SELECT 1 as ok;")
-    return {"ok": bool(row and row.get("ok") == 1)}
+def _normalize_hat_name(name: str) -> str:
+    return " ".join(name.strip().split())
 
 
-#hats
-@mcp.tool()
-async def list_hats(limit: int = 50, offset: int = 0, active_only: bool = True) -> Dict[str, Any]:
+async def _find_hat_by_name_exact_or_like(hat_name: str) -> Optional[Dict[str, Any]]:
     """
-    Purpose:
-      List hat styles from the `hats` table with pagination support.
-
-    Args:
-      limit (int): Max number of hats to return.
-      offset (int): Number of hats to skip (pagination).
-      active_only (bool): If True, returns only hats where is_active = 1.
-
-    Returns:
-      Dict:
-        - count (int): Number of hats returned.
-        - hats (List[Dict]): Each hat includes id, name, internal_style_code, description, min_qty.
+    Try exact-ish match first; if not found, fallback to ILIKE.
     """
-    where = "WHERE is_active = 1" if active_only else ""
-    hats = await fetch_all(
-        f"""
-        SELECT id, name, internal_style_code, description, min_qty
-        FROM hats
-        {where}
-        ORDER BY id ASC
-        LIMIT $1 OFFSET $2
-        """,
-        limit, offset
-    )
-    return {"count": len(hats), "hats": hats}
-
-
-@mcp.tool()
-async def get_hat_by_id(hat_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch a single hat record by hat id.
-
-    Args:
-      hat_id (str|int): Hat style primary key (hats.id).
-
-    Returns:
-      Dict:
-        - If found: Hat fields including id, name, internal_style_code, description, size_chart_json, min_qty, is_active.
-        - If not found: {"error": "..."}.
-    """
-    hid = _normalize_int(hat_id)
-    hat = await fetch_one(
+    hn = _normalize_hat_name(hat_name)
+    row = await fetch_one(
         """
-        SELECT id, name, internal_style_code, description, size_chart_json, min_qty, is_active
+        SELECT id, name, description, min_qty, size_chart_json
         FROM hats
-        WHERE id = $1
+        WHERE is_active = 1 AND LOWER(name) = LOWER($1)
+        LIMIT 1
         """,
-        hid
+        hn,
     )
-    return hat or {"error": f"Hat id {hid} not found"}
+    if row:
+        return row
 
-
-@mcp.tool()
-async def search_hats(keyword: str, limit: int = 30) -> Dict[str, Any]:
-    """
-    Purpose:
-      Search hat by keyword across name, internal_style_code, and description.
-
-    Args:
-      keyword (str): Search keyword.
-      limit (int): Max number of results to return.
-
-    Returns:
-      Dict:
-        - keyword (str): Input keyword.
-        - count (int): Number of hats returned.
-        - hats (List[Dict]): Matching hats (id, name, internal_style_code, description, min_qty).
-    """
-    pat = build_ilike_pattern(keyword)
-    hats = await fetch_all(
+    pat = build_ilike_pattern(hn)
+    row = await fetch_one(
         """
-        SELECT id, name, internal_style_code, description, min_qty
+        SELECT id, name, description, min_qty, size_chart_json
         FROM hats
         WHERE is_active = 1
-          AND (name ILIKE $1 OR internal_style_code ILIKE $1 OR COALESCE(description,'') ILIKE $1)
-        ORDER BY id ASC
-        LIMIT $2
+          AND (name ILIKE $1 OR COALESCE(description,'') ILIKE $1)
+        ORDER BY
+          CASE WHEN name ILIKE $1 THEN 0 ELSE 1 END,
+          id ASC
+        LIMIT 1
         """,
-        pat, limit
+        pat,
     )
-    return {"keyword": keyword, "count": len(hats), "hats": hats}
+    return row
 
 
-@mcp.tool()
-async def get_hat_min_qty(hat_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch the min_qty for a hat.
-
-    Args:
-      hat_id (str|int): Hat style id (hats.id).
-
-    Returns:
-      Dict:
-        - If found: {"id": <hat_id>, "min_qty": <int|null>}
-        - If not found: {"error": "..."}
-    """
-    hid = _normalize_int(hat_id)
-    row = await fetch_one("SELECT id, min_qty FROM hats WHERE id=$1", hid)
-    return row or {"error": f"Hat id {hid} not found"}
-
-
-#COLORS
-@mcp.tool()
-async def list_hat_colors(hat_id: Union[str, int], active_only: bool = True) -> Dict[str, Any]:
-    """
-    Purpose:
-      List available colors for a given hat.
-
-    Args:
-      hat_id (str|int): Hat style id (hat_colors.hat_style_id).
-      active_only (bool): If True, return only colors where is_active = 1.
-
-    Returns:
-      Dict:
-        - hat_id (int): Normalized hat id.
-        - count (int): Number of colors returned.
-        - colors (List[Dict]): Each color includes id, name, color_code, primary_image_url.
-    """
-    hid = _normalize_int(hat_id)
-    where = "AND hc.is_active = 1" if active_only else ""
-    colors = await fetch_all(
-        f"""
-        SELECT hc.id, hc.name, hc.color_code, hc.primary_image_url
-        FROM hat_colors hc
-        WHERE hc.hat_style_id = $1
-        {where}
-        ORDER BY hc.id ASC
-        """,
-        hid
-    )
-    return {"hat_id": hid, "count": len(colors), "colors": colors}
-
-
-@mcp.tool()
-async def get_hat_color_by_id(hat_color_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch a single hat color record by its id.
-
-    Args:
-      hat_color_id (str|int): HatColor primary key (hat_colors.id).
-
-    Returns:
-      Dict:
-        - If found: Color fields including id, hat_style_id, name, color_code, primary_image_url, is_active.
-        - If not found: {"error": "..."}.
-    """
-    cid = _normalize_int(hat_color_id)
-    color = await fetch_one(
+async def _get_hat_style_images(hat_id: int) -> List[Dict[str, Any]]:
+    rows = await fetch_all(
         """
-        SELECT id, hat_style_id, name, color_code, primary_image_url, is_active
-        FROM hat_colors
-        WHERE id = $1
+        SELECT image_url, image_type, alt_text, sort_order, is_primary
+        FROM hat_images
+        WHERE hat_style_id = $1
+          AND is_active = 1
+        ORDER BY is_primary DESC, sort_order ASC NULLS LAST
         """,
-        cid
+        hat_id,
     )
-    return color or {"error": f"HatColor id {cid} not found"}
+    for r in rows:
+        r["image_url"] = _full_url(r.get("image_url"))
+    return rows
 
 
-@mcp.tool()
-async def search_colors_for_hat(hat_id: Union[str, int], keyword: str, limit: int = 30) -> Dict[str, Any]:
+async def _get_color_images(hat_color_id: int) -> List[Dict[str, Any]]:
+    rows = await fetch_all(
+        """
+        SELECT image_url, image_type, alt_text, sort_order, is_primary
+        FROM hat_images
+        WHERE hat_color_id = $1
+          AND is_active = 1
+        ORDER BY is_primary DESC, sort_order ASC NULLS LAST
+        """,
+        hat_color_id,
+    )
+    for r in rows:
+        r["image_url"] = _full_url(r.get("image_url"))
+    return rows
+
+
+async def _get_sizes_for_hat(hat_id: int) -> List[Dict[str, Any]]:
     """
-    Purpose:
-      Search colors for a given hat style by keyword (name or color_code).
-
-    Args:
-      hat_id (str|int): Hat style id (hat_colors.hat_style_id).
-      keyword (str): Search keyword.
-      limit (int): Max number of results.
-
-    Returns:
-      Dict:
-        - hat_id (int): Normalized hat id.
-        - keyword (str): Input keyword.
-        - count (int): Number of colors returned.
-        - colors (List[Dict]): Matching colors (id, name, color_code, primary_image_url).
+    Returns sizes grouped by color name (no IDs exposed).
     """
-    hid = _normalize_int(hat_id)
-    pat = build_ilike_pattern(keyword)
-    colors = await fetch_all(
+    rows = await fetch_all(
+        """
+        SELECT
+          hc.name as color_name,
+          hsv.size_label,
+          hsv.variant_name
+        FROM hat_colors hc
+        JOIN hat_size_variants hsv
+          ON hsv.hat_color_id = hc.id
+         AND hsv.is_active = 1
+        WHERE hc.hat_style_id = $1
+          AND hc.is_active = 1
+        ORDER BY hc.name ASC, hsv.size_label ASC, hsv.variant_name ASC
+        """,
+        hat_id,
+    )
+
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    for r in rows:
+        c = r["color_name"]
+        grouped.setdefault(c, []).append(
+            {
+                "size_label": r["size_label"],
+                "variant_name": r["variant_name"],
+            }
+        )
+
+    out = []
+    for color_name in sorted(grouped.keys()):
+        out.append({"color_name": color_name, "sizes": grouped[color_name]})
+    return out
+
+
+async def _get_colors_for_hat(hat_id: int) -> List[Dict[str, Any]]:
+    rows = await fetch_all(
         """
         SELECT id, name, color_code, primary_image_url
         FROM hat_colors
         WHERE hat_style_id = $1
           AND is_active = 1
-          AND (name ILIKE $2 OR COALESCE(color_code,'') ILIKE $2)
+        ORDER BY name ASC
+        """,
+        hat_id,
+    )
+
+    out = []
+    for r in rows:
+        color_id = int(r["id"])
+        color_images = await _get_color_images(color_id)
+
+        out.append(
+            {
+                "color_name": r["name"],
+                "color_code": r.get("color_code"),
+                "primary_image_url": _full_url(r.get("primary_image_url")),
+                "color_images": color_images,
+            }
+        )
+    return out
+
+
+async def _get_decoration_types() -> List[Dict[str, Any]]:
+    rows = await fetch_all(
+        """
+        SELECT name, code, description
+        FROM primary_decoration_types
+        WHERE is_active = 1
         ORDER BY id ASC
-        LIMIT $3
-        """,
-        hid, pat, limit
+        """
     )
-    return {"hat_id": hid, "keyword": keyword, "count": len(colors), "colors": colors}
+    # no internal ids
+    return [
+        {"name": r["name"], "code": r["code"], "description": r.get("description")}
+        for r in rows
+    ]
 
 
-# SIZES (variants)
-@mcp.tool()
-async def list_sizes_for_color(hat_color_id: Union[str, int], active_only: bool = True) -> Dict[str, Any]:
+async def _get_style_price_tiers_for_hat(hat_id: int) -> Dict[str, Any]:
     """
-    Purpose:
-      List all size variants for a specific hat color.
-
-    Args:
-      hat_color_id (str|int): HatColor id (hat_size_variants.hat_color_id).
-      active_only (bool): If True, return only sizes where is_active = 1.
-
-    Returns:
-      Dict:
-        - hat_color_id (int): Normalized color id.
-        - count (int): Number of sizes returned.
-        - sizes (List[Dict]): Each size includes id, size_label, variant_name, supplier_sku.
+    Returns tiers grouped by decoration type CODE (e.g., EMBROIDERY / LEATHER_PATCH).
     """
-    cid = _normalize_int(hat_color_id)
-    where = "AND hsv.is_active = 1" if active_only else ""
-    sizes = await fetch_all(
-        f"""
-        SELECT hsv.id, hsv.size_label, hsv.variant_name, hsv.supplier_sku
-        FROM hat_size_variants hsv
-        WHERE hsv.hat_color_id = $1
-        {where}
-        ORDER BY hsv.id ASC
-        """,
-        cid
-    )
-    return {"hat_color_id": cid, "count": len(sizes), "sizes": sizes}
-
-
-@mcp.tool()
-async def list_sizes_for_hat(hat_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      List all size variants for a hat across all its colors.
-
-    Args:
-      hat_id (str|int): Hat style id (hat_colors.hat_style_id).
-
-    Returns:
-      Dict:
-        - hat_id (int): Normalized hat id.
-        - count (int): Number of size records returned.
-        - sizes (List[Dict]): Rows include hat_color_id, color_name, hat_size_variant_id, size_label, variant_name, supplier_sku.
-    """
-    hid = _normalize_int(hat_id)
-    sizes = await fetch_all(
+    rows = await fetch_all(
         """
         SELECT
-          hc.id as hat_color_id,
-          hc.name as color_name,
-          hsv.id as hat_size_variant_id,
-          hsv.size_label,
-          hsv.variant_name,
-          hsv.supplier_sku
-        FROM hat_colors hc
-        JOIN hat_size_variants hsv ON hsv.hat_color_id = hc.id
-        WHERE hc.hat_style_id = $1
-          AND hc.is_active = 1
-          AND hsv.is_active = 1
-        ORDER BY hc.id, hsv.id
+          pdt.name as decoration_name,
+          pdt.code as decoration_code,
+          sdt.min_qty,
+          sdt.max_qty,
+          sdt.display_label,
+          sdt.unit_price
+        FROM style_decoration_price_tiers sdt
+        JOIN primary_decoration_types pdt
+          ON pdt.id = sdt.decoration_type_id
+        WHERE sdt.hat_id = $1
+          AND sdt.is_active = 1
+          AND pdt.is_active = 1
+        ORDER BY pdt.id ASC, sdt.min_qty ASC
         """,
-        hid
+        hat_id,
     )
-    return {"hat_id": hid, "count": len(sizes), "sizes": sizes}
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    for r in rows:
+        code = r["decoration_code"]
+        grouped.setdefault(
+            code,
+            {
+                "decoration_name": r["decoration_name"],
+                "decoration_code": code,
+                "tiers": [],
+            },
+        )
+        grouped[code]["tiers"].append(
+            {
+                "min_qty": int(r["min_qty"]),
+                "max_qty": int(r["max_qty"]) if r.get("max_qty") is not None else None,
+                "display_label": r.get("display_label"),
+                "unit_price": float(r["unit_price"]),
+            }
+        )
+
+    # keep stable order
+    return {"price_tiers_by_decoration": list(grouped.values()), "currency": "USD"}
 
 
-@mcp.tool()
-async def get_size_variant_by_id(hat_size_variant_id: Union[str, int]) -> Dict[str, Any]:
+async def _best_tier_unit_price(hat_id: int, decoration_code_or_name: str, quantity: int) -> Optional[Dict[str, Any]]:
     """
-    Purpose:
-      Fetch a single size variant record by its id.
-
-    Args:
-      hat_size_variant_id (str|int): Size variant id (hat_size_variants.id).
-
-    Returns:
-      Dict:
-        - If found: id, hat_color_id, size_label, variant_name, supplier_sku, is_active.
-        - If not found: {"error": "..."}.
+    Find the single best matching tier row for a hat + decoration by code/name.
     """
-    sid = _normalize_int(hat_size_variant_id)
+    q = int(quantity)
+    key = decoration_code_or_name.strip()
+
     row = await fetch_one(
         """
-        SELECT id, hat_color_id, size_label, variant_name, supplier_sku, is_active
-        FROM hat_size_variants
-        WHERE id = $1
-        """,
-        sid
-    )
-    return row or {"error": f"HatSizeVariant id {sid} not found"}
-
-
-# IMAGES
-@mcp.tool()
-async def list_hat_images(hat_id: Union[str, int], image_type: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Purpose:
-      List images for a hat. Optionally filter by image_type.
-
-    Args:
-      hat_id (str|int): Hat style id (hat_images.hat_style_id).
-      image_type (Optional[str]): If provided, filter by hat_images.image_type.
-
-    Returns:
-      Dict:
-        - hat_id (int)
-        - image_type (Optional[str])
-        - count (int)
-        - images (List[Dict]): Each includes id, image_url, image_type, alt_text, sort_order, is_primary.
-    """
-    hid = _normalize_int(hat_id)
-    if image_type:
-        rows = await fetch_all(
-            """
-            SELECT id, image_url, image_type, alt_text, sort_order, is_primary
-            FROM hat_images
-            WHERE hat_style_id = $1
-              AND is_active = 1
-              AND image_type = $2
-            ORDER BY is_primary DESC, sort_order ASC, id ASC
-            """,
-            hid, image_type
-        )
-    else:
-        rows = await fetch_all(
-            """
-            SELECT id, image_url, image_type, alt_text, sort_order, is_primary
-            FROM hat_images
-            WHERE hat_style_id = $1
-              AND is_active = 1
-            ORDER BY is_primary DESC, sort_order ASC, id ASC
-            """,
-            hid
-        )
-    return {"hat_id": hid, "image_type": image_type, "count": len(rows), "images": rows}
-
-
-@mcp.tool()
-async def list_color_images(hat_color_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      List images for a specific hat color.
-
-    Args:
-      hat_color_id (str|int): HatColor id (hat_images.hat_color_id).
-
-    Returns:
-      Dict:
-        - hat_color_id (int)
-        - count (int)
-        - images (List[Dict]): id, image_url, image_type, alt_text, sort_order, is_primary.
-    """
-    cid = _normalize_int(hat_color_id)
-    rows = await fetch_all(
-        """
-        SELECT id, image_url, image_type, alt_text, sort_order, is_primary
-        FROM hat_images
-        WHERE hat_color_id = $1
-          AND is_active = 1
-        ORDER BY is_primary DESC, sort_order ASC, id ASC
-        """,
-        cid
-    )
-    return {"hat_color_id": cid, "count": len(rows), "images": rows}
-
-
-@mcp.tool()
-async def get_primary_image_for_hat(hat_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch the primary image for a hat style (is_primary = 1).
-
-    Args:
-      hat_id (str|int): Hat style id (hat_images.hat_style_id).
-
-    Returns:
-      Dict:
-        - If found: id, image_url, image_type, alt_text
-        - If not found: {"error": "..."}
-    """
-    hid = _normalize_int(hat_id)
-    row = await fetch_one(
-        """
-        SELECT id, image_url, image_type, alt_text
-        FROM hat_images
-        WHERE hat_style_id = $1
-          AND is_active = 1
-          AND is_primary = 1
-        ORDER BY id ASC
+        SELECT
+          pdt.name as decoration_name,
+          pdt.code as decoration_code,
+          sdt.min_qty,
+          sdt.max_qty,
+          sdt.display_label,
+          sdt.unit_price
+        FROM style_decoration_price_tiers sdt
+        JOIN primary_decoration_types pdt ON pdt.id = sdt.decoration_type_id
+        WHERE sdt.hat_id = $1
+          AND sdt.is_active = 1
+          AND pdt.is_active = 1
+          AND (pdt.code ILIKE $2 OR pdt.name ILIKE $2)
+          AND sdt.min_qty <= $3
+          AND (sdt.max_qty IS NULL OR $3 <= sdt.max_qty)
+        ORDER BY sdt.min_qty DESC
         LIMIT 1
         """,
-        hid
+        hat_id,
+        build_ilike_pattern(key),
+        q,
     )
-    return row or {"error": f"No primary image found for hat {hid}"}
+    if row:
+        return {
+            "decoration_name": row["decoration_name"],
+            "decoration_code": row["decoration_code"],
+            "min_qty": int(row["min_qty"]),
+            "max_qty": int(row["max_qty"]) if row.get("max_qty") is not None else None,
+            "display_label": row.get("display_label"),
+            "unit_price": float(row["unit_price"]),
+            "currency": "USD",
+        }
 
-
-# PRIMARY DECORATION TYPES
-@mcp.tool()
-async def list_primary_decoration_types(active_only: bool = True) -> Dict[str, Any]:
-    """
-    Purpose:
-      List all primary decoration types (e.g., Embroidery, Leather Patch).
-
-    Args:
-      active_only (bool): If True, return only decoration types where is_active = 1.
-
-    Returns:
-      Dict:
-        - count (int)
-        - decoration_types (List[Dict]): id, name, code, description, is_primary, is_active.
-    """
-    where = "WHERE is_active = 1" if active_only else ""
-    rows = await fetch_all(
-        f"""
-        SELECT id, name, code, description, is_primary, is_active
-        FROM primary_decoration_types
-        {where}
-        ORDER BY id ASC
-        """
-    )
-    return {"count": len(rows), "decoration_types": rows}
-
-
-@mcp.tool()
-async def get_primary_decoration_type(decoration_type_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch a single primary decoration type record by id.
-
-    Args:
-      decoration_type_id (str|int): PrimaryDecorationType id.
-
-    Returns:
-      Dict:
-        - If found: id, name, code, description, is_primary, is_active
-        - If not found: {"error": "..."}
-    """
-    did = _normalize_int(decoration_type_id)
+    # fallback: closest min_qty <= quantity (even if max_qty mismatch)
     row = await fetch_one(
         """
-        SELECT id, name, code, description, is_primary, is_active
-        FROM primary_decoration_types
-        WHERE id = $1
+        SELECT
+          pdt.name as decoration_name,
+          pdt.code as decoration_code,
+          sdt.min_qty,
+          sdt.max_qty,
+          sdt.display_label,
+          sdt.unit_price
+        FROM style_decoration_price_tiers sdt
+        JOIN primary_decoration_types pdt ON pdt.id = sdt.decoration_type_id
+        WHERE sdt.hat_id = $1
+          AND sdt.is_active = 1
+          AND pdt.is_active = 1
+          AND (pdt.code ILIKE $2 OR pdt.name ILIKE $2)
+          AND sdt.min_qty <= $3
+        ORDER BY sdt.min_qty DESC
+        LIMIT 1
         """,
-        did
+        hat_id,
+        build_ilike_pattern(key),
+        q,
     )
-    return row or {"error": f"PrimaryDecorationType id {did} not found"}
+    if not row:
+        return None
+
+    return {
+        "decoration_name": row["decoration_name"],
+        "decoration_code": row["decoration_code"],
+        "min_qty": int(row["min_qty"]),
+        "max_qty": int(row["max_qty"]) if row.get("max_qty") is not None else None,
+        "display_label": row.get("display_label"),
+        "unit_price": float(row["unit_price"]),
+        "currency": "USD",
+    }
 
 
-# STYLE DECORATION PRICE TIERS (base unit price)
-@mcp.tool()
-async def list_style_price_tiers_for_hat(hat_id: Union[str, int], decoration_type_id: Optional[int] = None) -> Dict[str, Any]:
-    """
-    Purpose:
-      List all style decoration price tiers for a hat.
-      Optionally filter tiers by decoration_type_id.
+async def _list_addons_with_tiers() -> List[Dict[str, Any]]:
+    addons = await fetch_all(
+        """
+        SELECT id, name, code, type, description
+        FROM decoration_addons
+        WHERE is_active = 1
+        ORDER BY type ASC, name ASC
+        """
+    )
 
-    Args:
-      hat_id (str|int): Hat style id (style_decoration_price_tiers.hat_id).
-      decoration_type_id (Optional[int]): If provided, returns tiers only for that decoration type.
-
-    Returns:
-      Dict:
-        - hat_id (int)
-        - decoration_type_id (Optional[int])
-        - count (int)
-        - tiers (List[Dict]): id, decoration_type_id, min_qty, max_qty, display_label, unit_price.
-    """
-    hid = _normalize_int(hat_id)
-    if decoration_type_id:
-        did = _normalize_int(decoration_type_id)
-        rows = await fetch_all(
+    out = []
+    for a in addons:
+        tiers = await fetch_all(
             """
-            SELECT id, decoration_type_id, min_qty, max_qty, display_label, unit_price
-            FROM style_decoration_price_tiers
-            WHERE hat_id = $1
-              AND decoration_type_id = $2
+            SELECT min_qty, max_qty, unit_price
+            FROM decoration_addon_price_tiers
+            WHERE decoration_addon_id = $1
               AND is_active = 1
             ORDER BY min_qty ASC
             """,
-            hid, did
+            int(a["id"]),
         )
-    else:
-        rows = await fetch_all(
-            """
-            SELECT id, decoration_type_id, min_qty, max_qty, display_label, unit_price
-            FROM style_decoration_price_tiers
-            WHERE hat_id = $1
-              AND is_active = 1
-            ORDER BY decoration_type_id ASC, min_qty ASC
-            """,
-            hid
+        out.append(
+            {
+                "name": a["name"],
+                "code": a["code"],
+                "type": a["type"],
+                "description": a.get("description"),
+                "tiers": [
+                    {
+                        "min_qty": int(t["min_qty"]),
+                        "max_qty": int(t["max_qty"]) if t.get("max_qty") is not None else None,
+                        "unit_price": float(t["unit_price"]),
+                    }
+                    for t in tiers
+                ],
+            }
         )
-    return {"hat_id": hid, "decoration_type_id": decoration_type_id, "count": len(rows), "tiers": rows}
+    return out
 
 
-@mcp.tool()
-async def get_style_unit_price(hat_id: Union[str, int], decoration_type_id: Union[str, int], quantity: int) -> Dict[str, Any]:
-    """
-    Purpose:
-      Return the best matching style price tier (unit price) for:
-      hat_id + decoration_type_id + quantity.
-
-    Args:
-      hat_id (str|int): Hat style id.
-      decoration_type_id (str|int): Primary decoration type id.
-      quantity (int): Total order quantity.
-
-    Returns:
-      Dict:
-        - If found: id, min_qty, max_qty, unit_price, display_label
-        - If not found: {"error": "..."}
-    """
-    hid = _normalize_int(hat_id)
-    did = _normalize_int(decoration_type_id)
-    qty = _tier_bucket(_normalize_int(quantity))
-
-    row = await fetch_one(
+async def _addon_best_unit_price_by_code(addon_code: str, quantity: int) -> Optional[Dict[str, Any]]:
+    q = int(quantity)
+    addon = await fetch_one(
         """
-        SELECT id, min_qty, max_qty, unit_price, display_label
-        FROM style_decoration_price_tiers
-        WHERE hat_id = $1
-          AND decoration_type_id = $2
-          AND is_active = 1
-          AND min_qty <= $3
-          AND (max_qty IS NULL OR $3 <= max_qty)
-        ORDER BY min_qty DESC
-        LIMIT 1
-        """,
-        hid, did, qty
-    )
-
-    if not row:
-        row = await fetch_one(
-            """
-            SELECT id, min_qty, max_qty, unit_price, display_label
-            FROM style_decoration_price_tiers
-            WHERE hat_id = $1
-              AND decoration_type_id = $2
-              AND is_active = 1
-              AND min_qty <= $3
-            ORDER BY min_qty DESC
-            LIMIT 1
-            """,
-            hid, did, qty
-        )
-
-    return row or {"error": f"No price tier found for hat={hid}, decoration_type={did}, qty={qty}"}
-
-
-# INVENTORY
-@mcp.tool()
-async def get_inventory_by_size_variant(hat_size_variant_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch inventory info for a specific size variant.
-
-    Args:
-      hat_size_variant_id (str|int): Hat size variant id (inventory_items.hat_size_variant_id).
-
-    Returns:
-      Dict:
-        - If found: id, hat_size_variant_id, qty_on_hand, qty_reserved, qty_available, status, source
-        - If not found: {"error": "..."}
-    """
-    sid = _normalize_int(hat_size_variant_id)
-    row = await fetch_one(
-        """
-        SELECT id, hat_size_variant_id, qty_on_hand, qty_reserved, qty_available, status, source
-        FROM inventory_items
-        WHERE hat_size_variant_id = $1
-          AND is_active = 1
-        ORDER BY id ASC
-        LIMIT 1
-        """,
-        sid
-    )
-    return row or {"error": f"No inventory row found for hat_size_variant_id={sid}"}
-
-
-@mcp.tool()
-async def get_inventory_for_color(hat_color_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch inventory availability for all size variants under a given color.
-
-    Args:
-      hat_color_id (str|int): HatColor id.
-
-    Returns:
-      Dict:
-        - hat_color_id (int)
-        - count (int)
-        - inventory (List[Dict]): hat_size_variant_id, size_label, variant_name, qty_available, status.
-    """
-    cid = _normalize_int(hat_color_id)
-    rows = await fetch_all(
-        """
-        SELECT
-          hsv.id as hat_size_variant_id,
-          hsv.size_label,
-          hsv.variant_name,
-          ii.qty_available,
-          ii.status
-        FROM hat_size_variants hsv
-        LEFT JOIN inventory_items ii
-          ON ii.hat_size_variant_id = hsv.id AND ii.is_active = 1
-        WHERE hsv.hat_color_id = $1
-          AND hsv.is_active = 1
-        ORDER BY hsv.id ASC
-        """,
-        cid
-    )
-    return {"hat_color_id": cid, "count": len(rows), "inventory": rows}
-
-
-@mcp.tool()
-async def get_inventory_for_hat(hat_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch inventory availability for all colors and sizes of a hat style.
-
-    Args:
-      hat_id (str|int): Hat style id.
-
-    Returns:
-      Dict:
-        - hat_id (int)
-        - count (int)
-        - inventory (List[Dict]): color + size + qty_available + status for each variant.
-    """
-    hid = _normalize_int(hat_id)
-    rows = await fetch_all(
-        """
-        SELECT
-          hc.id as hat_color_id,
-          hc.name as color_name,
-          hsv.id as hat_size_variant_id,
-          hsv.size_label,
-          hsv.variant_name,
-          ii.qty_available,
-          ii.status
-        FROM hat_colors hc
-        JOIN hat_size_variants hsv ON hsv.hat_color_id = hc.id AND hsv.is_active=1
-        LEFT JOIN inventory_items ii ON ii.hat_size_variant_id = hsv.id AND ii.is_active=1
-        WHERE hc.hat_style_id = $1
-          AND hc.is_active = 1
-        ORDER BY hc.id ASC, hsv.id ASC
-        """,
-        hid
-    )
-    return {"hat_id": hid, "count": len(rows), "inventory": rows}
-
-
-# DECORATION ADDONS + ADDON TIERS
-@mcp.tool()
-async def list_decoration_addons(active_only: bool = True, addon_type: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Purpose:
-      List available decoration add-ons (e.g. 3D puff, back stitching, etc.).
-      Optionally filter by add-on type.
-
-    Args:
-      active_only (bool): If True, return only add-ons where is_active = 1.
-      addon_type (Optional[str]): If provided, filter by decoration_addons.type.
-
-    Returns:
-      Dict:
-        - count (int)
-        - addons (List[Dict]): id, name, code, type, description, is_active.
-    """
-    clauses = ["1=1"]
-    args: List[Any] = []
-    if active_only:
-        clauses.append("is_active = 1")
-    if addon_type:
-        clauses.append("type = $1")
-        args.append(addon_type)
-
-    where = " AND ".join(clauses)
-    rows = await fetch_all(
-        f"""
-        SELECT id, name, code, type, description, is_active
+        SELECT id, name, code, type
         FROM decoration_addons
-        WHERE {where}
-        ORDER BY id ASC
-        """,
-        *args
-    )
-    return {"count": len(rows), "addons": rows}
-
-
-@mcp.tool()
-async def get_decoration_addon_by_code(code: str) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch one decoration add-on by its unique code.
-
-    Args:
-      code (str): DecorationAddon code (decoration_addons.code).
-
-    Returns:
-      Dict:
-        - If found: id, name, code, type, description, is_active
-        - If not found: {"error": "..."}
-    """
-    row = await fetch_one(
-        """
-        SELECT id, name, code, type, description, is_active
-        FROM decoration_addons
-        WHERE code = $1
+        WHERE is_active = 1 AND code = $1
         LIMIT 1
         """,
-        code
+        addon_code,
     )
-    return row or {"error": f"DecorationAddon code '{code}' not found"}
-
-
-@mcp.tool()
-async def list_addon_price_tiers(decoration_addon_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      List all price tiers for a decoration add-on.
-
-    Args:
-      decoration_addon_id (str|int): DecorationAddon id (decoration_addon_price_tiers.decoration_addon_id).
-
-    Returns:
-      Dict:
-        - decoration_addon_id (int)
-        - count (int)
-        - tiers (List[Dict]): id, min_qty, max_qty, unit_price.
-    """
-    aid = _normalize_int(decoration_addon_id)
-    rows = await fetch_all(
-        """
-        SELECT id, min_qty, max_qty, unit_price
-        FROM decoration_addon_price_tiers
-        WHERE decoration_addon_id = $1
-          AND is_active = 1
-        ORDER BY min_qty ASC
-        """,
-        aid
-    )
-    return {"decoration_addon_id": aid, "count": len(rows), "tiers": rows}
-
-
-@mcp.tool()
-async def get_addon_unit_price(decoration_addon_id: Union[str, int], quantity: int) -> Dict[str, Any]:
-    """
-    Purpose:
-      Get the best matching add-on tier unit price for a given quantity.
-
-    Args:
-      decoration_addon_id (str|int): DecorationAddon id.
-      quantity (int): Order quantity.
-
-    Returns:
-      Dict:
-        - If found: id, min_qty, max_qty, unit_price
-        - If not found: {"error": "..."}
-    """
-    aid = _normalize_int(decoration_addon_id)
-    qty = _tier_bucket(_normalize_int(quantity))
+    if not addon:
+        return None
 
     row = await fetch_one(
         """
-        SELECT id, min_qty, max_qty, unit_price
+        SELECT min_qty, max_qty, unit_price
         FROM decoration_addon_price_tiers
         WHERE decoration_addon_id = $1
           AND is_active = 1
@@ -808,13 +373,13 @@ async def get_addon_unit_price(decoration_addon_id: Union[str, int], quantity: i
         ORDER BY min_qty DESC
         LIMIT 1
         """,
-        aid, qty
+        int(addon["id"]),
+        q,
     )
-
     if not row:
         row = await fetch_one(
             """
-            SELECT id, min_qty, max_qty, unit_price
+            SELECT min_qty, max_qty, unit_price
             FROM decoration_addon_price_tiers
             WHERE decoration_addon_id = $1
               AND is_active = 1
@@ -822,132 +387,81 @@ async def get_addon_unit_price(decoration_addon_id: Union[str, int], quantity: i
             ORDER BY min_qty DESC
             LIMIT 1
             """,
-            aid, qty
+            int(addon["id"]),
+            q,
         )
+    if not row:
+        return None
 
-    return row or {"error": f"No addon tier found for addon_id={aid}, qty={qty}"}
+    return {
+        "addon_name": addon["name"],
+        "addon_code": addon["code"],
+        "addon_type": addon["type"],
+        "unit_price": float(row["unit_price"]),
+        "min_qty": int(row["min_qty"]),
+        "max_qty": int(row["max_qty"]) if row.get("max_qty") is not None else None,
+        "currency": "USD",
+    }
 
 
-# ARTWORK SETUP PLAN + RULES
-@mcp.tool()
-async def list_artwork_setup_plans(active_only: bool = True) -> Dict[str, Any]:
-    """
-    Purpose:
-      List available artwork setup plans (e.g., Standard, Premium) with base fees.
-
-    Args:
-      active_only (bool): If True, return only plans where is_active = 1.
-
-    Returns:
-      Dict:
-        - count (int)
-        - plans (List[Dict]): id, name, code, base_fee, description, is_active.
-    """
-    where = "WHERE is_active = 1" if active_only else ""
-    rows = await fetch_all(
-        f"""
-        SELECT id, name, code, base_fee, description, is_active
+async def _list_artwork_setup_plans_with_rules() -> List[Dict[str, Any]]:
+    plans = await fetch_all(
+        """
+        SELECT id, name, code, base_fee, description
         FROM artwork_setup_plans
-        {where}
+        WHERE is_active = 1
         ORDER BY id ASC
         """
     )
-    return {"count": len(rows), "plans": rows}
+
+    out = []
+    for p in plans:
+        rules = await fetch_all(
+            """
+            SELECT min_total_items, discount_type, discount_value
+            FROM artwork_setup_rules
+            WHERE setup_plan_id = $1
+              AND is_active = 1
+            ORDER BY min_total_items ASC
+            """,
+            int(p["id"]),
+        )
+        out.append(
+            {
+                "name": p["name"],
+                "code": p["code"],
+                "base_fee": float(p["base_fee"]),
+                "description": p.get("description"),
+                "rules": [
+                    {
+                        "min_total_items": int(r["min_total_items"]),
+                        "discount_type": r["discount_type"],
+                        "discount_value": float(r["discount_value"]),
+                    }
+                    for r in rules
+                ],
+            }
+        )
+    return out
 
 
-@mcp.tool()
-async def get_artwork_setup_plan_by_code(code: str) -> Dict[str, Any]:
-    """
-    Purpose:
-      Fetch an artwork setup plan by its unique code.
-
-    Args:
-      code (str): ArtworkSetupPlan code (artwork_setup_plans.code).
-
-    Returns:
-      Dict:
-        - If found: id, name, code, base_fee, description, is_active
-        - If not found: {"error": "..."}
-    """
-    row = await fetch_one(
-        """
-        SELECT id, name, code, base_fee, description, is_active
-        FROM artwork_setup_plans
-        WHERE code = $1
-        LIMIT 1
-        """,
-        code
-    )
-    return row or {"error": f"ArtworkSetupPlan code '{code}' not found"}
-
-
-@mcp.tool()
-async def list_artwork_setup_rules(setup_plan_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      List discount rules for a given artwork setup plan.
-
-    Args:
-      setup_plan_id (str|int): Setup plan id (artwork_setup_rules.setup_plan_id).
-
-    Returns:
-      Dict:
-        - setup_plan_id (int)
-        - count (int)
-        - rules (List[Dict]): id, setup_plan_id, min_total_items, discount_type, discount_value, is_active.
-    """
-    pid = _normalize_int(setup_plan_id)
-    rows = await fetch_all(
-        """
-        SELECT id, setup_plan_id, min_total_items, discount_type, discount_value, is_active
-        FROM artwork_setup_rules
-        WHERE setup_plan_id = $1
-          AND is_active = 1
-        ORDER BY min_total_items ASC
-        """,
-        pid
-    )
-    return {"setup_plan_id": pid, "count": len(rows), "rules": rows}
-
-
-@mcp.tool()
-async def get_artwork_setup_fee(setup_plan_id: Union[str, int], total_items: int) -> Dict[str, Any]:
-    """
-    Purpose:
-      Compute the final artwork setup fee for a plan at a given total_items quantity.
-      Applies the best matching rule where min_total_items <= total_items.
-
-    Args:
-      setup_plan_id (str|int): Artwork setup plan id.
-      total_items (int): Total number of items in the order.
-
-    Returns:
-      Dict:
-        - setup_plan (Dict): id, name, code
-        - base_fee (float)
-        - applied_discount (Dict|None): rule_id, discount_type, discount_value
-        - final_fee (float)
-        - currency (str)
-      Or:
-        - {"error": "..."} if plan not found/disabled
-    """
-    pid = _normalize_int(setup_plan_id)
-    items = _normalize_int(total_items)
-
+async def _calc_artwork_setup_fee_by_code(setup_plan_code: str, total_items: int) -> Optional[Dict[str, Any]]:
+    items = int(total_items)
     plan = await fetch_one(
         """
         SELECT id, name, code, base_fee
         FROM artwork_setup_plans
-        WHERE id = $1 AND is_active = 1
+        WHERE is_active = 1 AND code = $1
+        LIMIT 1
         """,
-        pid
+        setup_plan_code,
     )
     if not plan:
-        return {"error": f"ArtworkSetupPlan id {pid} not found/disabled"}
+        return None
 
     rule = await fetch_one(
         """
-        SELECT id, min_total_items, discount_type, discount_value
+        SELECT min_total_items, discount_type, discount_value
         FROM artwork_setup_rules
         WHERE setup_plan_id = $1
           AND is_active = 1
@@ -955,7 +469,8 @@ async def get_artwork_setup_fee(setup_plan_id: Union[str, int], total_items: int
         ORDER BY min_total_items DESC
         LIMIT 1
         """,
-        pid, items
+        int(plan["id"]),
+        items,
     )
 
     base_fee = float(plan["base_fee"])
@@ -963,16 +478,16 @@ async def get_artwork_setup_fee(setup_plan_id: Union[str, int], total_items: int
     applied = None
 
     if rule:
-        dtype = (rule["discount_type"] or "").upper()
+        dtype = (_safe_str(rule["discount_type"])).upper()
         dval = float(rule["discount_value"])
         if dtype in ("PERCENT", "PERCENTAGE"):
             final_fee = max(0.0, base_fee * (1.0 - dval / 100.0))
         elif dtype in ("FLAT", "AMOUNT"):
             final_fee = max(0.0, base_fee - dval)
-        applied = {"rule_id": rule["id"], "discount_type": dtype, "discount_value": dval}
+        applied = {"discount_type": dtype, "discount_value": dval, "min_total_items": int(rule["min_total_items"])}
 
     return {
-        "setup_plan": {"id": plan["id"], "name": plan["name"], "code": plan["code"]},
+        "setup_plan": {"name": plan["name"], "code": plan["code"]},
         "base_fee": base_fee,
         "applied_discount": applied,
         "final_fee": round(final_fee, 2),
@@ -980,102 +495,66 @@ async def get_artwork_setup_fee(setup_plan_id: Union[str, int], total_items: int
     }
 
 
-# SHIPPING METHODS + RULES
-@mcp.tool()
-async def list_shipping_methods(active_only: bool = True) -> Dict[str, Any]:
-    """
-    Purpose:
-      List available shipping methods.
-
-    Args:
-      active_only (bool): If True, return only active shipping methods (is_active = 1).
-
-    Returns:
-      Dict:
-        - count (int)
-        - methods (List[Dict]): id, name, code, base_rate, is_active.
-    """
-    where = "WHERE is_active = 1" if active_only else ""
-    rows = await fetch_all(
-        f"""
-        SELECT id, name, code, base_rate, is_active
+async def _list_shipping_methods_with_rules() -> List[Dict[str, Any]]:
+    methods = await fetch_all(
+        """
+        SELECT id, name, code, base_rate
         FROM shipping_methods
-        {where}
+        WHERE is_active = 1
         ORDER BY id ASC
         """
     )
-    return {"count": len(rows), "methods": rows}
+
+    out = []
+    for m in methods:
+        rules = await fetch_all(
+            """
+            SELECT min_total_items, min_subtotal_amount, discount_type, discount_value
+            FROM shipping_rules
+            WHERE shipping_method_id = $1
+              AND is_active = 1
+            ORDER BY min_total_items ASC, COALESCE(min_subtotal_amount, 0) ASC
+            """,
+            int(m["id"]),
+        )
+        out.append(
+            {
+                "name": m["name"],
+                "code": m["code"],
+                "base_rate": float(m["base_rate"]),
+                "rules": [
+                    {
+                        "min_total_items": int(r["min_total_items"]),
+                        "min_subtotal_amount": float(r["min_subtotal_amount"]) if r.get("min_subtotal_amount") is not None else None,
+                        "discount_type": r["discount_type"],
+                        "discount_value": float(r["discount_value"]),
+                    }
+                    for r in rules
+                ],
+            }
+        )
+    return out
 
 
-@mcp.tool()
-async def list_shipping_rules(shipping_method_id: Union[str, int]) -> Dict[str, Any]:
-    """
-    Purpose:
-      List shipping rules for a given shipping method (e.g., free shipping above X items).
-
-    Args:
-      shipping_method_id (str|int): Shipping method id (shipping_rules.shipping_method_id).
-
-    Returns:
-      Dict:
-        - shipping_method_id (int)
-        - count (int)
-        - rules (List[Dict]): id, shipping_method_id, min_total_items, min_subtotal_amount, discount_type, discount_value.
-    """
-    mid = _normalize_int(shipping_method_id)
-    rows = await fetch_all(
-        """
-        SELECT id, shipping_method_id, min_total_items, min_subtotal_amount, discount_type, discount_value
-        FROM shipping_rules
-        WHERE shipping_method_id = $1
-          AND is_active = 1
-        ORDER BY min_total_items ASC
-        """,
-        mid
-    )
-    return {"shipping_method_id": mid, "count": len(rows), "rules": rows}
-
-
-@mcp.tool()
-async def get_shipping_cost(shipping_method_id: Union[str, int], total_items: int, subtotal_amount: float = 0.0) -> Dict[str, Any]:
-    """
-    Purpose:
-      Compute shipping cost for a shipping method based on:
-      base_rate minus best-matching shipping rule discount.
-
-    Args:
-      shipping_method_id (str|int): Shipping method id.
-      total_items (int): Total number of items in the order.
-      subtotal_amount (float): Subtotal amount (used if min_subtotal_amount is configured).
-
-    Returns:
-      Dict:
-        - shipping_method (Dict): id, name, code
-        - base_rate (float)
-        - applied_discount (Dict|None): rule_id, discount_type, discount_value
-        - final_shipping_cost (float)
-        - currency (str)
-      Or:
-        - {"error": "..."} if method not found/disabled
-    """
-    mid = _normalize_int(shipping_method_id)
-    items = _normalize_int(total_items)
+async def _calc_shipping_cost_by_code(shipping_code: str, total_items: int, subtotal_amount: float) -> Optional[Dict[str, Any]]:
+    items = int(total_items)
     subtotal = float(subtotal_amount or 0.0)
 
     method = await fetch_one(
         """
         SELECT id, name, code, base_rate
         FROM shipping_methods
-        WHERE id = $1 AND is_active = 1
+        WHERE is_active = 1 AND code = $1
+        LIMIT 1
         """,
-        mid
+        shipping_code,
     )
     if not method:
-        return {"error": f"ShippingMethod id {mid} not found/disabled"}
+        return None
 
     rule = await fetch_one(
         """
-        SELECT id, min_total_items, min_subtotal_amount, discount_type, discount_value
+        SELECT min_total_items, min_subtotal_amount, discount_type, discount_value
         FROM shipping_rules
         WHERE shipping_method_id = $1
           AND is_active = 1
@@ -1084,7 +563,9 @@ async def get_shipping_cost(shipping_method_id: Union[str, int], total_items: in
         ORDER BY min_total_items DESC, COALESCE(min_subtotal_amount, 0) DESC
         LIMIT 1
         """,
-        mid, items, subtotal
+        int(method["id"]),
+        items,
+        subtotal,
     )
 
     base_rate = float(method["base_rate"])
@@ -1092,7 +573,7 @@ async def get_shipping_cost(shipping_method_id: Union[str, int], total_items: in
     applied = None
 
     if rule:
-        dtype = (rule["discount_type"] or "").upper()
+        dtype = (_safe_str(rule["discount_type"])).upper()
         dval = float(rule["discount_value"])
         if dtype in ("PERCENT", "PERCENTAGE"):
             final = max(0.0, base_rate * (1.0 - dval / 100.0))
@@ -1100,10 +581,15 @@ async def get_shipping_cost(shipping_method_id: Union[str, int], total_items: in
             final = max(0.0, base_rate - dval)
         elif dtype in ("FREE",):
             final = 0.0
-        applied = {"rule_id": rule["id"], "discount_type": dtype, "discount_value": dval}
+        applied = {
+            "discount_type": dtype,
+            "discount_value": dval,
+            "min_total_items": int(rule["min_total_items"]),
+            "min_subtotal_amount": float(rule["min_subtotal_amount"]) if rule.get("min_subtotal_amount") is not None else None,
+        }
 
     return {
-        "shipping_method": {"id": method["id"], "name": method["name"], "code": method["code"]},
+        "shipping_method": {"name": method["name"], "code": method["code"]},
         "base_rate": base_rate,
         "applied_discount": applied,
         "final_shipping_cost": round(final, 2),
@@ -1111,189 +597,609 @@ async def get_shipping_cost(shipping_method_id: Union[str, int], total_items: in
     }
 
 
-#full-summary
+#MCP functions
 @mcp.tool()
-async def get_hat_full_summary(hat_id: Union[str, int]) -> Dict[str, Any]:
+async def health_check() -> Dict[str, Any]:
     """
     Purpose:
-      Provide a compact summary for chatbot responses:
-      hat info + all colors + total size count + a primary image URL.
+      - Confirm DB connectivity for the chatbot backend.
 
     Args:
-      hat_id (str|int): Hat style id.
+      - None
 
     Returns:
-      Dict:
-        - hat (Dict): id, name, internal_style_code, description, min_qty
-        - colors (List[Dict]): id, name, color_code, primary_image_url
-        - sizes_total (int): Total number of size variants across all colors
-        - primary_image (str|None): Primary image URL if found
-      Or:
-        - {"error": "..."} if hat not found
+      - {"ok": true/false}
+
+    Expected user questions this supports:
+      - "Is the system working?"
+      - "Are you online?"
+      - "Can you check the database connection?"
     """
-    hid = _normalize_int(hat_id)
-    hat = await fetch_one(
+    row = await fetch_one("SELECT 1 AS ok;")
+    return {"ok": bool(row and row.get("ok") == 1)}
+
+
+@mcp.tool()
+async def search_hats_catalog(search_text: str, limit: int = 10) -> Dict[str, Any]:
+    """
+    Purpose:
+      - Customer-friendly hat search using a natural phrase.
+      - Searches in hat name + description.
+
+    Args:
+      - search_text (str): any phrase like "trucker", "mesh", "snapback", "camo", etc.
+      - limit (int): max hats to return (default 10)
+
+    Returns:
+      - {
+          "query": "...",
+          "count": N,
+          "hats": [
+            {
+              "hat_name": "...",
+              "description": "...",
+              "min_order_qty": 24,
+              "primary_image": "https://.../path.jpg"
+            }, ...
+          ]
+        }
+
+    Expected user questions this supports:
+      - "Show me trucker hats"
+      - "Do you have camo hats?"
+      - "I want hats for outdoor events"
+      - "Find snapback options"
+      - "Search hats with mesh"
+    """
+    pat = build_ilike_pattern(search_text)
+    rows = await fetch_all(
         """
-        SELECT id, name, internal_style_code, description, min_qty
+        SELECT id, name, description, min_qty
         FROM hats
-        WHERE id = $1
-        """,
-        hid
-    )
-    if not hat:
-        return {"error": f"Hat id {hid} not found"}
-
-    colors = await fetch_all(
-        """
-        SELECT id, name, color_code, primary_image_url
-        FROM hat_colors
-        WHERE hat_style_id = $1 AND is_active = 1
+        WHERE is_active = 1
+          AND (name ILIKE $1 OR COALESCE(description,'') ILIKE $1)
         ORDER BY id ASC
+        LIMIT $2
         """,
-        hid
+        pat,
+        int(limit),
     )
 
-    size_count = await fetch_one(
-        """
-        SELECT COUNT(*)::int as cnt
-        FROM hat_colors hc
-        JOIN hat_size_variants hsv ON hsv.hat_color_id = hc.id AND hsv.is_active=1
-        WHERE hc.hat_style_id = $1 AND hc.is_active=1
-        """,
-        hid
-    )
+    hats = []
+    for r in rows:
+        imgs = await _get_hat_style_images(int(r["id"]))
+        primary = None
+        if imgs:
+            primary = imgs[0].get("image_url")
+        hats.append(
+            {
+                "hat_name": r["name"],
+                "description": r.get("description"),
+                "min_order_qty": r.get("min_qty"),
+                "primary_image": primary,
+            }
+        )
 
-    primary_image = await fetch_one(
-        """
-        SELECT image_url
-        FROM hat_images
-        WHERE hat_style_id = $1 AND is_active=1
-        ORDER BY is_primary DESC, sort_order ASC, id ASC
-        LIMIT 1
-        """,
-        hid
-    )
+    return {"query": search_text, "count": len(hats), "hats": hats}
+
+
+@mcp.tool()
+async def get_hat_info_by_name(hat_name: str) -> Dict[str, Any]:
+    """
+    Purpose:
+      - The MUST-HAVE tool: customer asks by hat name and gets full details:
+        - hat description + min order qty
+        - hat style images
+        - colors available + each color's images
+        - sizes available (grouped by color)
+        - decoration types available
+        - tier pricing for Embroidery + Leather Patch (and any other decoration types)
+
+    Args:
+      - hat_name (str): customer-provided name (full or partial)
+
+    Returns:
+      - {
+          "hat_name": "...",
+          "description": "...",
+          "min_order_qty": 24,
+          "style_images": [...],
+          "colors": [...],
+          "sizes_by_color": [...],
+          "decoration_types": [...],
+          "pricing_tiers": {...}
+        }
+
+    Expected user questions this supports:
+      - "Tell me about <hat name>"
+      - "Show details of <hat name>"
+      - "What colors and sizes are available for <hat name>?"
+      - "What is embroidery price and leather patch price for <hat name>?"
+      - "Show me full details including images for <hat name>"
+    """
+    hat = await _find_hat_by_name_exact_or_like(hat_name)
+    if not hat:
+        return {"error": f"Hat not found for name: '{hat_name}'. Try a different spelling or use search."}
+
+    hid = int(hat["id"])
+    style_images = await _get_hat_style_images(hid)
+    colors = await _get_colors_for_hat(hid)
+    sizes_by_color = await _get_sizes_for_hat(hid)
+    decoration_types = await _get_decoration_types()
+    pricing_tiers = await _get_style_price_tiers_for_hat(hid)
 
     return {
-        "hat": hat,
+        "hat_name": hat["name"],
+        "description": hat.get("description"),
+        "min_order_qty": hat.get("min_qty"),
+        "size_chart": hat.get("size_chart_json"),
+        "style_images": style_images,
         "colors": colors,
-        "sizes_total": (size_count or {}).get("cnt", 0),
-        "primary_image": (primary_image or {}).get("image_url"),
+        "sizes_by_color": sizes_by_color,
+        "decoration_types": decoration_types,
+        "pricing_tiers": pricing_tiers,
     }
 
 
 @mcp.tool()
-async def estimate_order_pricing(
-    hat_id: Union[str, int],
-    decoration_type_id: Union[str, int],
+async def get_hat_full_summary(hat_name: str) -> Dict[str, Any]:
+    """
+    Purpose:
+      - A compact, customer-friendly summary view for a hat:
+        - description + min qty
+        - colors count + sizes count
+        - 1 primary image
+        - quick view of available decoration type codes
+
+    Args:
+      - hat_name (str): customer-provided hat name (full/partial)
+
+    Returns:
+      - {
+          "hat_name": "...",
+          "description": "...",
+          "min_order_qty": 24,
+          "primary_image": "https://...",
+          "colors_available": [ ... ],
+          "total_colors": N,
+          "total_sizes": M,
+          "available_decorations": [ {"name":"Embroidery","code":"EMBROIDERY"}, ... ]
+        }
+
+    Expected user questions this supports:
+      - "Give me a quick summary of <hat name>"
+      - "Do you have this hat in many colors?"
+      - "How many sizes are available for <hat name>?"
+      - "What decoration options are available for <hat name>?"
+    """
+    hat = await _find_hat_by_name_exact_or_like(hat_name)
+    if not hat:
+        return {"error": f"Hat not found for name: '{hat_name}'."}
+
+    hid = int(hat["id"])
+
+    # colors
+    color_rows = await fetch_all(
+        """
+        SELECT id, name, primary_image_url
+        FROM hat_colors
+        WHERE hat_style_id = $1 AND is_active=1
+        ORDER BY name ASC
+        """,
+        hid,
+    )
+
+    colors_available = []
+    total_sizes = 0
+
+    for c in color_rows:
+        cid = int(c["id"])
+        sizes = await fetch_all(
+            """
+            SELECT size_label, variant_name
+            FROM hat_size_variants
+            WHERE hat_color_id=$1 AND is_active=1
+            """,
+            cid,
+        )
+        total_sizes += len(sizes)
+
+        colors_available.append(
+            {
+                "color_name": c["name"],
+                "primary_image_url": _full_url(c.get("primary_image_url")),
+            }
+        )
+
+    # primary style image
+    imgs = await _get_hat_style_images(hid)
+    primary_image = imgs[0].get("image_url") if imgs else None
+
+    # decorations available for this hat (from tiers)
+    dec_rows = await fetch_all(
+        """
+        SELECT DISTINCT pdt.name, pdt.code
+        FROM style_decoration_price_tiers sdt
+        JOIN primary_decoration_types pdt ON pdt.id = sdt.decoration_type_id
+        WHERE sdt.hat_id=$1 AND sdt.is_active=1 AND pdt.is_active=1
+        ORDER BY pdt.code ASC
+        """,
+        hid,
+    )
+
+    return {
+        "hat_name": hat["name"],
+        "description": hat.get("description"),
+        "min_order_qty": hat.get("min_qty"),
+        "primary_image": primary_image,
+        "colors_available": colors_available,
+        "total_colors": len(color_rows),
+        "total_sizes": total_sizes,
+        "available_decorations": [{"name": r["name"], "code": r["code"]} for r in dec_rows],
+    }
+
+
+@mcp.tool()
+async def list_pricing_guide() -> Dict[str, Any]:
+    """
+    Purpose:
+      - One tool to return ALL global pricing configuration info needed by chatbot:
+        - Primary decoration types
+        - Decoration addons + addon price tiers (includes stitching, puff, patch options etc)
+        - Artwork setup plans + setup rules
+        - Shipping methods + shipping rules
+
+    Args:
+      - None
+
+    Returns:
+      - {
+          "decoration_types": [...],
+          "decoration_addons": [...],
+          "artwork_setup_plans": [...],
+          "shipping_methods": [...],
+          "currency": "USD"
+        }
+
+    Expected user questions this supports:
+      - "What customization options do you offer?"
+      - "What are the available add-ons and their pricing tiers?"
+      - "What artwork setup plans exist?"
+      - "How does shipping pricing and free shipping work?"
+      - "Show me all pricing rules and options"
+    """
+    decoration_types = await _get_decoration_types()
+    addons_with_tiers = await _list_addons_with_tiers()
+    setup_plans_with_rules = await _list_artwork_setup_plans_with_rules()
+    shipping_methods_with_rules = await _list_shipping_methods_with_rules()
+
+    return {
+        "decoration_types": decoration_types,
+        "decoration_addons": addons_with_tiers,
+        "artwork_setup_plans": setup_plans_with_rules,
+        "shipping_methods": shipping_methods_with_rules,
+        "currency": "USD",
+    }
+
+
+@mcp.tool()
+async def get_hat_price_only(
+    hat_name: str,
     quantity: int,
-    addon_ids: Optional[List[int]] = None,
-    shipping_method_id: Optional[int] = None,
-    artwork_setup_plan_id: Optional[int] = None,
+    decoration: str,
 ) -> Dict[str, Any]:
     """
     Purpose:
-      Provide a high-level order pricing estimate:
-        - Base unit price from style_decoration_price_tiers (by decoration type and qty)
-        - Optional add-ons (sum of addon tier unit prices)
-        - Optional artwork setup fee (plan base fee minus discount rule)
-        - Optional shipping cost (base rate minus discount rule)
+      - Return ONLY the hat's base tier unit price for a given quantity and decoration type.
+      - This is useful when customer asks: "What's the price per hat for 48 with embroidery?"
 
     Args:
-      hat_id (str|int): Hat style id.
-      decoration_type_id (str|int): Primary decoration type id.
-      quantity (int): Total quantity ordered.
-      addon_ids (Optional[List[int]]): List of decoration_addons ids to apply.
-      shipping_method_id (Optional[int]): Shipping method id to estimate shipping.
-      artwork_setup_plan_id (Optional[int]): Artwork setup plan id to estimate setup fee.
+      - hat_name (str): customer hat name
+      - quantity (int): order qty
+      - decoration (str): decoration type code or name (e.g., "EMBROIDERY", "Leather Patch")
 
     Returns:
-      Dict:
-        - inputs (Dict): normalized ids + quantity used
-        - pricing (Dict):
-            base_unit_price (float)
-            addons_unit_price_total (float)
-            unit_price (float)
-            items_total (float)
-            artwork_setup_fee (float)
-            shipping_cost (float)
-            grand_total (float)
-            currency (str)
-        - details (Dict):
-            base_tier (Dict)
-            addons (List[Dict])
-            setup (Dict|None)
-            shipping (Dict|None)
-      Or:
-        - {"error": "..."} if base tier cannot be resolved
-    """
-    hid = _normalize_int(hat_id)
-    did = _normalize_int(decoration_type_id)
-    qty = _normalize_int(quantity)
+      - {
+          "hat_name": "...",
+          "quantity": 48,
+          "decoration": {"name":"Embroidery","code":"EMBROIDERY"},
+          "matched_tier": {...},
+          "unit_price": 12.50,
+          "items_total": 600.00,
+          "currency": "USD"
+        }
 
-    base_tier = await get_style_unit_price(hid, did, qty)
-    if "error" in base_tier:
-        return base_tier
+    Expected user questions this supports:
+      - "Price for 48 hats with embroidery for <hat name>"
+      - "What’s the leather patch price tier for 144 of <hat name>?"
+      - "Give me per-unit price for 24 with embroidery for <hat name>"
+    """
+    hat = await _find_hat_by_name_exact_or_like(hat_name)
+    if not hat:
+        return {"error": f"Hat not found: '{hat_name}'."}
+
+    hid = int(hat["id"])
+    tier = await _best_tier_unit_price(hid, decoration, int(quantity))
+    if not tier:
+        return {"error": f"No pricing tiers found for '{hat['name']}' with decoration '{decoration}'."}
+
+    unit = float(tier["unit_price"])
+    qty = int(quantity)
+    return {
+        "hat_name": hat["name"],
+        "quantity": qty,
+        "decoration": {"name": tier["decoration_name"], "code": tier["decoration_code"]},
+        "matched_tier": {
+            "min_qty": tier["min_qty"],
+            "max_qty": tier["max_qty"],
+            "display_label": tier.get("display_label"),
+        },
+        "unit_price": unit,
+        "items_total": round(unit * qty, 2),
+        "currency": "USD",
+    }
+
+
+@mcp.tool()
+async def estimate_total_order_price(
+    hat_name: str,
+    quantity: int,
+    decoration: str,
+    addon_codes: Optional[List[str]] = None,
+    setup_plan_code: Optional[str] = None,
+    shipping_method_code: Optional[str] = None,
+) -> Dict[str, Any]:
+    """
+    Purpose:
+      - Customer-style total estimate tool:
+        - Base tier price (hat + decoration)
+        - Optional add-on unit prices (by addon CODE list)
+        - Optional artwork setup fee (by setup plan CODE)
+        - Optional shipping cost (by shipping method CODE, uses subtotal rules)
+
+    Args:
+      - hat_name (str): customer hat name
+      - quantity (int): order qty
+      - decoration (str): "EMBROIDERY" or "LEATHER_PATCH" or name
+      - addon_codes (list[str] | None): e.g. ["BACK_STITCHING", "3D_PUFF"] (codes from list_pricing_guide)
+      - setup_plan_code (str | None): e.g. "STANDARD" / "PREMIUM" (codes from list_pricing_guide)
+      - shipping_method_code (str | None): e.g. "GROUND" / "EXPRESS" (codes from list_pricing_guide)
+
+    Returns:
+      - {
+          "hat_name": "...",
+          "quantity": 48,
+          "base": { "unit_price": 12.5, "items_total": 600 },
+          "addons": { "unit_addons_total": 2.0, "addons_breakdown": [...] },
+          "artwork_setup": {...} | None,
+          "shipping": {...} | None,
+          "grand_total": 650.00,
+          "currency": "USD"
+        }
+
+    Expected user questions this supports:
+      - "Total cost for 48 of <hat name> with embroidery + back stitching"
+      - "Estimate price for 144 <hat name> with leather patch + premium setup"
+      - "How much will 96 hats cost including shipping?"
+      - "What’s the total with addons and setup fee?"
+    """
+    hat = await _find_hat_by_name_exact_or_like(hat_name)
+    if not hat:
+        return {"error": f"Hat not found: '{hat_name}'."}
+
+    hid = int(hat["id"])
+    qty = int(quantity)
+
+    # base tier
+    base_tier = await _best_tier_unit_price(hid, decoration, qty)
+    if not base_tier:
+        return {"error": f"No base pricing tiers found for '{hat['name']}' and decoration '{decoration}'."}
 
     base_unit = float(base_tier["unit_price"])
-    addons_breakdown = []
-    addons_total_unit = 0.0
+    items_total = base_unit * qty
 
-    if addon_ids:
-        for aid in addon_ids:
-            tier = await get_addon_unit_price(aid, qty)
-            if "error" in tier:
-                addons_breakdown.append({"addon_id": aid, "error": tier["error"]})
+    # addons
+    addons_breakdown: List[Dict[str, Any]] = []
+    addons_unit_total = 0.0
+    if addon_codes:
+        for code in addon_codes:
+            code = code.strip()
+            if not code:
                 continue
-            up = float(tier["unit_price"])
-            addons_total_unit += up
-            addons_breakdown.append({"addon_id": aid, "unit_price": up, "tier_id": tier["id"]})
+            best = await _addon_best_unit_price_by_code(code, qty)
+            if not best:
+                addons_breakdown.append({"addon_code": code, "error": "Addon not found or no tier pricing."})
+                continue
+            addons_unit_total += float(best["unit_price"])
+            addons_breakdown.append(
+                {
+                    "addon_name": best["addon_name"],
+                    "addon_code": best["addon_code"],
+                    "addon_type": best["addon_type"],
+                    "unit_price": float(best["unit_price"]),
+                }
+            )
 
-    unit_price = base_unit + addons_total_unit
-    items_total = unit_price * qty
+    unit_price = base_unit + addons_unit_total
+    items_total_with_addons = unit_price * qty
 
-    setup_fee = 0.0
+    # artwork setup
     setup_info = None
-    if artwork_setup_plan_id:
-        setup_info = await get_artwork_setup_fee(artwork_setup_plan_id, qty)
-        if "error" not in setup_info:
+    setup_fee = 0.0
+    if setup_plan_code:
+        setup_info = await _calc_artwork_setup_fee_by_code(setup_plan_code, qty)
+        if not setup_info:
+            setup_info = {"error": f"Setup plan '{setup_plan_code}' not found."}
+        else:
             setup_fee = float(setup_info["final_fee"])
 
-    shipping_cost = 0.0
+    # shipping
     shipping_info = None
-    if shipping_method_id:
-        shipping_info = await get_shipping_cost(shipping_method_id, qty, items_total)
-        if "error" not in shipping_info:
+    shipping_cost = 0.0
+    if shipping_method_code:
+        shipping_info = await _calc_shipping_cost_by_code(shipping_method_code, qty, items_total_with_addons)
+        if not shipping_info:
+            shipping_info = {"error": f"Shipping method '{shipping_method_code}' not found."}
+        else:
             shipping_cost = float(shipping_info["final_shipping_cost"])
 
-    grand_total = items_total + setup_fee + shipping_cost
+    grand_total = items_total_with_addons + setup_fee + shipping_cost
 
     return {
-        "inputs": {
-            "hat_id": hid,
-            "decoration_type_id": did,
-            "quantity": qty,
-            "addon_ids": addon_ids or [],
-            "shipping_method_id": shipping_method_id,
-            "artwork_setup_plan_id": artwork_setup_plan_id,
-        },
-        "pricing": {
-            "base_unit_price": base_unit,
-            "addons_unit_price_total": round(addons_total_unit, 2),
-            "unit_price": round(unit_price, 2),
+        "hat_name": hat["name"],
+        "quantity": qty,
+        "decoration": {"name": base_tier["decoration_name"], "code": base_tier["decoration_code"]},
+        "base": {
+            "unit_price": round(base_unit, 2),
             "items_total": round(items_total, 2),
-            "artwork_setup_fee": round(setup_fee, 2),
-            "shipping_cost": round(shipping_cost, 2),
-            "grand_total": round(grand_total, 2),
-            "currency": "USD",
+            "matched_tier": {
+                "min_qty": base_tier["min_qty"],
+                "max_qty": base_tier["max_qty"],
+                "display_label": base_tier.get("display_label"),
+            },
         },
-        "details": {
-            "base_tier": base_tier,
-            "addons": addons_breakdown,
-            "setup": setup_info,
-            "shipping": shipping_info,
+        "addons": {
+            "unit_addons_total": round(addons_unit_total, 2),
+            "addons_breakdown": addons_breakdown,
         },
+        "unit_price_with_addons": round(unit_price, 2),
+        "items_total_with_addons": round(items_total_with_addons, 2),
+        "artwork_setup": setup_info,
+        "shipping": shipping_info,
+        "grand_total": round(grand_total, 2),
+        "currency": "USD",
     }
+
+
+@mcp.tool()
+async def list_customization_options() -> Dict[str, Any]:
+    """
+    Purpose:
+      - Customer asks "What customization options do you offer?"
+      - Returns:
+        - decoration types (Embroidery, Leather Patch, etc.)
+        - addons grouped (stitching/placement/patch options/etc.)
+
+    Args:
+      - None
+
+    Returns:
+      - {
+          "decoration_types": [...],
+          "addons": [...]
+        }
+
+    Expected user questions this supports:
+      - "What customization options can I add?"
+      - "Do you offer back stitching / side stitching?"
+      - "What add-ons are available for embroidery?"
+      - "Show me all add-ons"
+    """
+    decoration_types = await _get_decoration_types()
+    addons = await _list_addons_with_tiers()
+    return {"decoration_types": decoration_types, "addons": addons, "currency": "USD"}
+
+
+@mcp.tool()
+async def list_artwork_setup_and_calculator(total_items: int = 24) -> Dict[str, Any]:
+    """
+    Purpose:
+      - Returns artwork setup plans + rules AND also shows computed setup fee
+        for a given total_items (customer-friendly).
+      - Helps user understand how setup fee discounts apply.
+
+    Args:
+      - total_items (int): quantity ordered, used to compute example final fees
+
+    Returns:
+      - {
+          "total_items": 48,
+          "plans": [
+              {
+                "name": "...",
+                "code": "...",
+                "base_fee": 30,
+                "example_final_fee_for_total_items": 20,
+                "rules": [...]
+              }
+          ],
+          "currency": "USD"
+        }
+
+    Expected user questions this supports:
+      - "What is the artwork setup fee?"
+      - "Do setup fees get discounted if I order more?"
+      - "Show setup plans and how they work for 48 hats"
+    """
+    items = int(total_items)
+    plans = await _list_artwork_setup_plans_with_rules()
+    enriched = []
+    for p in plans:
+        calc = await _calc_artwork_setup_fee_by_code(p["code"], items)
+        enriched.append(
+            {
+                "name": p["name"],
+                "code": p["code"],
+                "base_fee": p["base_fee"],
+                "description": p.get("description"),
+                "example_final_fee_for_total_items": (calc or {}).get("final_fee", p["base_fee"]),
+                "rules": p["rules"],
+            }
+        )
+    return {"total_items": items, "plans": enriched, "currency": "USD"}
+
+
+@mcp.tool()
+async def list_shipping_and_calculator(total_items: int = 24, subtotal_amount: float = 0.0) -> Dict[str, Any]:
+    """
+    Purpose:
+      - Customer-friendly shipping tool:
+        - returns shipping methods + their rules
+        - shows example final shipping cost for given total_items/subtotal
+
+    Args:
+      - total_items (int): total hats in order (used to evaluate shipping rules)
+      - subtotal_amount (float): example subtotal to evaluate rules with min_subtotal_amount
+
+    Returns:
+      - {
+          "inputs": {"total_items": 48, "subtotal_amount": 600.0},
+          "shipping_methods": [
+              {
+                "name": "...",
+                "code": "...",
+                "base_rate": 25,
+                "example_final_shipping_cost": 0,
+                "rules": [...]
+              }
+          ],
+          "currency": "USD"
+        }
+
+    Expected user questions this supports:
+      - "What shipping options do you have?"
+      - "Do you offer free shipping after a minimum order?"
+      - "How much will shipping cost for 48 hats?"
+      - "Show shipping rules"
+    """
+    items = int(total_items)
+    subtotal = float(subtotal_amount or 0.0)
+    methods = await _list_shipping_methods_with_rules()
+
+    enriched = []
+    for m in methods:
+        calc = await _calc_shipping_cost_by_code(m["code"], items, subtotal)
+        enriched.append(
+            {
+                "name": m["name"],
+                "code": m["code"],
+                "base_rate": m["base_rate"],
+                "example_final_shipping_cost": (calc or {}).get("final_shipping_cost", m["base_rate"]),
+                "rules": m["rules"],
+            }
+        )
+
+    return {"inputs": {"total_items": items, "subtotal_amount": subtotal}, "shipping_methods": enriched, "currency": "USD"}
 
 
 if __name__ == "__main__":
