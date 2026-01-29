@@ -20,7 +20,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY app.py .
+COPY app.py db.py client.py mcp_functions_db.py mcp_functions.py test_db_connection.py test_mcp_functions.py products.csv .
 
 # Create .env file if it doesn't exist (will be mounted or created manually)
 RUN touch .env
