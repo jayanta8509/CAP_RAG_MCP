@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  cap-mcp:
+    build: .
+    container_name: Cap-Mcp-chatbot
+    ports:
+      - "8001:8001"
+    env_file:
+      - .env
+    restart: unless-stopped
+    volumes:
+      # Mount .env file from host (you'll create it manually on server)
+      - ./.env:/app/.env
+    environment:
+      - PYTHONUNBUFFERED=1
