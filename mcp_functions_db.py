@@ -5,7 +5,7 @@ from db import fetch_one, fetch_all, build_ilike_pattern
 
 mcp = FastMCP("DB_Customer_Chatbot")
 
-BASE_URL = "https://adminapi.showmecustomapparel.com"
+BASE_URL = "https://showmecustomheadwearapi.bestworks.cloud"
 
 
 #utilities
