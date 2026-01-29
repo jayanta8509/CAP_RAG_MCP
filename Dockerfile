@@ -26,7 +26,7 @@ COPY app.py db.py client.py mcp_functions_db.py mcp_functions.py test_db_connect
 RUN touch .env
 
 # Expose port 8000
-EXPOSE 8000
+EXPOSE 8001
 
 # Run the application
 CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8001"]
